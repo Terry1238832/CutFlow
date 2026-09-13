@@ -199,7 +199,7 @@ struct SettingsView: View {
                     }
                 }
                 HStack {
-                    Text("CutFlow 1.1.2 · 本地运行 · 无网络请求")
+                    Text("CutFlow \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版") · 本地运行 · 无网络请求")
                     Spacer()
                     Button("退出应用") { NSApp.terminate(nil) }.buttonStyle(.plain)
                 }.font(.system(size: 10)).foregroundStyle(.tertiary)

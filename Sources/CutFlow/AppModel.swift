@@ -16,7 +16,7 @@ final class AppModel: ObservableObject {
     @Published var dimStatus = "等待 Finder 中的剪切"
     @Published var previewResult = ""
     @Published var isPreviewing = false
-    @Published var dimCutFiles = UserDefaults.standard.object(forKey: "dimCutFiles") as? Bool ?? true {
+    @Published var dimCutFiles = UserDefaults.standard.object(forKey: "dimCutFiles") as? Bool ?? false {
         didSet { UserDefaults.standard.set(dimCutFiles, forKey: "dimCutFiles"); updateDimming() }
     }
     let applicationPath = Bundle.main.bundleURL.path

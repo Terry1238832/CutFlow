@@ -3,6 +3,29 @@ import ApplicationServices
 import CutFlowCore
 
 final class KeyboardService {
+    struct ApplicationContext {
+        let bundleID: String
+        let pid: pid_t
+    }
+    private let pasteboard: NSPasteboard
+    private let currentApplication: () -> ApplicationContext?
+    private let fileContext: (pid_t) -> Bool
+    private let uptime: () -> TimeInterval
+
+    // These boundaries allow the actual event handler to be tested with an
+    // isolated pasteboard, without installing a tap or posting keyboard input.
+    init(pasteboard: NSPasteboard = .general,
+         currentApplication: @escaping () -> ApplicationContext? = {
+             guard let app = NSWorkspace.shared.frontmostApplication,
+                   let id = app.bundleIdentifier else { return nil }
+             return ApplicationContext(bundleID: id, pid: app.processIdentifier)
+         }, fileContext: ((pid_t) -> Bool)? = nil,
+         uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.pasteboard = pasteboard
+        self.currentApplication = currentApplication
+        self.fileContext = fileContext ?? Self.isFileContext
+        self.uptime = uptime
+    }
     var onChange: (() -> Void)?
     var onCutFilesChanged: (([URL]) -> Void)?
     var onVisualInterruption: (() -> Void)?
@@ -17,6 +40,7 @@ final class KeyboardService {
     private var poll: Timer?
     // Keep key-down and key-up consistent, even after focus/modifiers change.
     private var mappedKeys: [Int64: (key: Int64, option: Bool)] = [:]
+    private var suppressedKeys: Set<Int64> = []
     private let modifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift, .maskSecondaryFn]
 
     var tapIsActive: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
@@ -56,6 +80,7 @@ final class KeyboardService {
         if let tap { CFMachPortInvalidate(tap) }
         source = nil; tap = nil; running = false
         mappedKeys.removeAll()
+        suppressedKeys.removeAll()
         cancel()
     }
 
@@ -74,14 +99,14 @@ final class KeyboardService {
     func refreshClipboard() {
         guard session.state != .idle else { return }
         let old = session.state
-        let board = NSPasteboard.general
+        let board = pasteboard
         var files: [URL] = []
         if case let .awaitingCopy(baseline, _, _) = session.state, board.changeCount != baseline {
             files = (board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [NSURL] ?? []).map { $0 as URL }
         }
         session.observe(changeCount: board.changeCount, fileCount: files.count,
-                        frontmostOwner: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-                        now: ProcessInfo.processInfo.systemUptime)
+                        frontmostOwner: currentApplication()?.bundleID,
+                        now: uptime())
         if session.state != old {
             if case let .ready(_, owner, _) = session.state, owner == "com.apple.finder" {
                 updateCutFiles(files)
@@ -90,10 +115,11 @@ final class KeyboardService {
         }
     }
 
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             cancel()
             mappedKeys.removeAll()
+            suppressedKeys.removeAll()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
@@ -103,19 +129,24 @@ final class KeyboardService {
         }
         let key = event.getIntegerValueField(.keyboardEventKeycode)
         if type == .keyUp {
+            if suppressedKeys.remove(key) != nil { return nil }
             if let mapping = mappedKeys.removeValue(forKey: key) { remap(event, mapping.key, mapping.option) }
             return Unmanaged.passUnretained(event)
         }
         guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+        // A paste rejected while copying stays rejected until V is released.
+        // Otherwise its first repeat could move as soon as the copy completes.
+        if suppressedKeys.contains(key) { return nil }
         // Swallow repeated cut/move presses so holding V cannot move then copy again.
         if event.getIntegerValueField(.keyboardEventAutorepeat) != 0, mappedKeys[key] != nil { return nil }
         let flags = event.flags.intersection(modifiers)
         // A fresh copy/cut in any app cancels the old move intent, including an empty copy.
         if flags == .maskCommand && (key == 8 || key == 7) { cancel() }
         if key == 53 { cancel() }
-        guard enabled, let app = NSWorkspace.shared.frontmostApplication,
-              let owner = app.bundleIdentifier, ShortcutPolicy.supports(owner, forkLift: forkLift)
+        guard enabled, let app = currentApplication(),
+              ShortcutPolicy.supports(app.bundleID, forkLift: forkLift)
         else { return Unmanaged.passUnretained(event) }
+        let owner = app.bundleID
 
         if key == 9 && flags == [.maskCommand, .maskAlternate] {
             // Respect a manually invoked native move; do not retain a second pending move.
@@ -123,11 +154,10 @@ final class KeyboardService {
             return Unmanaged.passUnretained(event)
         }
         guard flags == .maskCommand, key == 7 || key == 9 else { return Unmanaged.passUnretained(event) }
-        if protectText && !isFileContext(pid: app.processIdentifier) { return Unmanaged.passUnretained(event) }
+        if protectText && !fileContext(app.pid) { return Unmanaged.passUnretained(event) }
 
         if key == 7 {
-            session.begin(changeCount: NSPasteboard.general.changeCount, owner: owner,
-                          now: ProcessInfo.processInfo.systemUptime)
+            session.begin(changeCount: pasteboard.changeCount, owner: owner, now: uptime())
             mappedKeys[key] = (8, false)
             remap(event, 8, false) // X → C; Finder remains responsible for copying.
             onChange?()
@@ -135,8 +165,8 @@ final class KeyboardService {
             refreshClipboard()
             // Do not paste an older clipboard if the user presses V before Finder
             // has completed the copy. A new press after capture performs the move.
-            if case .awaitingCopy = session.state { return nil }
-            if session.consumeMove(changeCount: NSPasteboard.general.changeCount, owner: owner) {
+            if case .awaitingCopy = session.state { suppressedKeys.insert(key); return nil }
+            if session.consumeMove(changeCount: pasteboard.changeCount, owner: owner) {
                 updateCutFiles([])
                 mappedKeys[key] = (9, true)
                 remap(event, 9, true) // V → Option-V; Finder owns conflicts, undo, and transfer.
@@ -149,11 +179,13 @@ final class KeyboardService {
     private func remap(_ event: CGEvent, _ key: Int64, _ option: Bool) {
         event.setIntegerValueField(.keyboardEventKeycode, value: key)
         if option { event.flags.insert(.maskAlternate) }
-        // Clear cached characters after changing the physical key code.
-        event.keyboardSetUnicodeString(stringLength: 0, unicodeString: nil)
+        // A zero-length setter leaves an existing Unicode payload unchanged on
+        // macOS. Keep both representations consistent with the intended command.
+        var character: UniChar = key == 8 ? 0x63 : 0x76 // c / v
+        event.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character)
     }
 
-    private func isFileContext(pid: pid_t) -> Bool {
+    private static func isFileContext(_ pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.08)
         var focused: CFTypeRef?
