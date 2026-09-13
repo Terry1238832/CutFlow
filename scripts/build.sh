@@ -17,7 +17,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create "$BUILD_CACHE/arm64-apple-macosx/release/CutFlow" "$BUILD_CACHE/x86_64-apple-macosx/release/CutFlow" -output "$APP/Contents/MacOS/CutFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 swift -module-cache-path "$BUILD_CACHE/icon-cache" scripts/icon.swift "$BUILD_CACHE/AppIcon.iconset" "$APP/Contents/Resources/AppIcon.icns"
-codesign --force --deep --sign "${CUTFLOW_SIGN_IDENTITY:--}" "$APP"
+SIGN_IDENTITY="${CUTFLOW_SIGN_IDENTITY:--}"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    codesign --force --sign - "$APP"
+else
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+fi
 codesign --verify --deep --strict "$APP"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$DESTINATION/CutFlow-macOS.zip"
 echo "Built: $APP"
