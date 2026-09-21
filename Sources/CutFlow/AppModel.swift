@@ -13,6 +13,8 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var detectionMessage: String?
     @Published var accessDiagnostic = ""
+    @Published var keyboardDiagnostic = ""
+    @Published var shortcutFailure: String?
     @Published var dimStatus = "等待 Finder 中的剪切"
     @Published var previewResult = ""
     @Published var isPreviewing = false
@@ -62,6 +64,7 @@ final class AppModel: ObservableObject {
         if !running { return "快捷键监听尚未启动" }
         if pendingCount > 0 { return "已剪切 \(pendingCount) 个项目" }
         if waiting { return "正在获取所选文件…" }
+        if shortcutFailure != nil { return "上次操作未完成" }
         return "已就绪，等待剪切"
     }
 
@@ -69,7 +72,8 @@ final class AppModel: ObservableObject {
         if !trusted { return "系统尚未认可当前运行的这份 CutFlow。若开关已开启，请查看下方修复步骤。" }
         if !enabled { return "重新启用后，快捷键会恢复工作。" }
         if !running { return "请检查辅助功能权限，然后退出并重新打开 CutFlow。" }
-        if pendingCount > 0 { return "前往目标文件夹，按 ⌘V 移动。按 Esc 取消剪切。" }
+        if pendingCount > 0 { return "选中一个目标文件夹，或进入目标目录后按 ⌘V 移动。按 Esc 取消剪切。" }
+        if let shortcutFailure { return shortcutFailure }
         return "文件移动及同名冲突由 Finder 或 ForkLift 处理。"
     }
 
@@ -144,12 +148,20 @@ final class AppModel: ObservableObject {
             : "\(time) 已重新尝试；当前应用仍未获得可用授权。请按下方步骤重新添加当前这一份应用。"
     }
 
+    func restartKeyboardListener() {
+        keyboard.stop()
+        refresh(forceRetry: true)
+    }
+
     func revealApplication() {
         NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
 
     private func synchronize() {
         running = keyboard.running
+        shortcutFailure = keyboard.lastFailure
+        keyboardDiagnostic = "已收到按键事件：\(keyboard.receivedKeyDownCount)\n" +
+            (keyboard.shortcutHistory.isEmpty ? "尚未收到 ⌘X / ⌘V" : keyboard.shortcutHistory.joined(separator: "\n"))
         switch keyboard.session.state {
         case .idle: pendingCount = 0; waiting = false
         case .awaitingCopy: pendingCount = 0; waiting = true

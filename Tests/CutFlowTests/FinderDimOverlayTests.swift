@@ -91,4 +91,48 @@ final class FinderDimOverlayTests: XCTestCase {
         XCTAssertFalse(FinderDimOverlayIdentity.pathBarConfirms([], directory: directory, cutURLs: [alpha]))
         XCTAssertFalse(FinderDimOverlayIdentity.pathBarConfirms([directory, URL(fileURLWithPath: "/elsewhere")], directory: directory, cutURLs: [alpha]))
     }
+
+    func testListUsesOneVerifiedFileRow() {
+        let label = CGRect(x: 130, y: 120, width: 140, height: 18)
+        let row = CGRect(x: 100, y: 118, width: 400, height: 22)
+        XCTAssertEqual(FinderDimOverlayGeometry.fileRow(label: label, container: row,
+            viewport: CGRect(x: 100, y: 100, width: 400, height: 300)), row)
+    }
+
+    func testExpandedFolderContainerCannotDimItsDescendants() {
+        let label = CGRect(x: 130, y: 120, width: 140, height: 18)
+        let subtree = CGRect(x: 100, y: 118, width: 400, height: 220)
+        let result = FinderDimOverlayGeometry.fileRow(label: label, container: subtree,
+            viewport: CGRect(x: 100, y: 100, width: 400, height: 300))
+        XCTAssertLessThan(result.height, 24)
+        XCTAssertTrue(result.contains(label))
+    }
+
+    func testColumnFallbackIncludesIconButNeverDrawsIntoAdjacentColumn() {
+        let label = CGRect(x: 108, y: 120, width: 180, height: 18)
+        let column = CGRect(x: 100, y: 100, width: 200, height: 300)
+        let result = FinderDimOverlayGeometry.fileRow(label: label, container: nil, viewport: column)
+        let clipped = FinderDimOverlayGeometry.clip(result, viewport: column,
+            window: CGRect(x: 0, y: 0, width: 700, height: 600))!
+        XCTAssertEqual(clipped.minX, column.minX)
+        XCTAssertLessThanOrEqual(clipped.maxX, column.maxX)
+        XCTAssertTrue(clipped.contains(label))
+    }
+
+    func testUnrelatedRowFrameIsNotUsedForFilename() {
+        let label = CGRect(x: 130, y: 120, width: 140, height: 18)
+        let wrongRow = CGRect(x: 100, y: 180, width: 400, height: 22)
+        let result = FinderDimOverlayGeometry.fileRow(label: label, container: wrongRow,
+            viewport: CGRect(x: 100, y: 100, width: 400, height: 300))
+        XCTAssertFalse(result.intersects(wrongRow))
+        XCTAssertTrue(result.contains(label))
+    }
+
+    func testSidebarAndPathBarAreNotClassifiedAsFileViews() {
+        XCTAssertNil(FinderFileView(identifier: "Sidebar"))
+        XCTAssertNil(FinderFileView(identifier: "PathBar"))
+        XCTAssertNil(FinderFileView(identifier: "ListViewHeader"))
+        XCTAssertEqual(FinderFileView(identifier: "ListView"), .list)
+        XCTAssertEqual(FinderFileView(identifier: "ColumnView"), .column)
+    }
 }

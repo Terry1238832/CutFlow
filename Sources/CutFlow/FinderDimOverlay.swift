@@ -1,6 +1,20 @@
 import AppKit
 import ApplicationServices
 
+enum FinderFileView: Equatable {
+    case icon, list, column, gallery
+
+    init?(identifier: String) {
+        switch identifier.lowercased() {
+        case "iconview": self = .icon
+        case "listview": self = .list
+        case "columnview": self = .column
+        case "galleryview": self = .gallery
+        default: return nil
+        }
+    }
+}
+
 /// Conservative identity rules: a filename is useful only after the window's
 /// directory has been established. An explicit, conflicting URL always wins.
 enum FinderDimOverlayIdentity {
@@ -40,6 +54,18 @@ enum FinderDimOverlayIdentity {
 }
 
 enum FinderDimOverlayGeometry {
+    /// Row containers may include expanded descendants. Only use a container
+    /// that is a single line; otherwise shade the verified filename and icon.
+    static func fileRow(label: CGRect, container: CGRect?, viewport: CGRect) -> CGRect {
+        if let container, valid(container), container.contains(label),
+           container.height <= max(32, label.height + 12),
+           container.width <= viewport.width + 2 {
+            return container
+        }
+        return CGRect(x: label.minX - 24, y: label.minY - 1,
+                      width: label.width + 28, height: label.height + 2)
+    }
+
     /// Window Server lists visible windows front-to-back. Both must be present
     /// before the UI can claim that the overlay is actually above its source.
     static func isInFront(window: CGWindowID, of source: CGWindowID,
@@ -61,7 +87,7 @@ enum FinderDimOverlayGeometry {
     }
 }
 
-/// This draws a temporary wash over verified Finder icon cells. It never edits
+/// This draws a temporary wash over verified Finder file cells. It never edits
 /// a file or Finder's UI attributes, and never captures the screen.
 final class FinderDimOverlay {
     var onStatus: ((String) -> Void)?
@@ -249,7 +275,7 @@ final class FinderDimOverlay {
         }
         guard !layout.items.isEmpty else {
             panel?.orderOut(nil)
-            sourceStatus("图标视图中未找到可确认的剪切项目；项目可能不可见或名称无法匹配")
+            sourceStatus("当前视图中未找到可确认的剪切项目；项目可能不可见或名称无法匹配")
             return
         }
         let frame = Self.cocoaFrame(layout.windowFrame)
@@ -295,8 +321,10 @@ final class FinderDimOverlay {
     private struct Node {
         let element: AXUIElement
         let depth: Int
-        let inIconView: Bool
+        let view: FinderFileView?
         let clip: CGRect
+        let rowFrame: CGRect?
+        let parentFrame: CGRect?
     }
 
     private static func query(pid: pid_t, directory: URL, urls: [URL],
@@ -311,11 +339,11 @@ final class FinderDimOverlay {
         // never reconstruct a filesystem path from localized display labels.
         let document = fileURL(attribute(window, kAXDocumentAttribute))
         let breadcrumbURLs = document == nil ? pathBarURLs(window) : []
-        if let document, FinderDimOverlayIdentity.path(document) != FinderDimOverlayIdentity.path(directory) {
-            return .unavailable("当前窗口目录与剪切文件的来源目录不一致")
-        }
-        let directoryConfirmed = document != nil
-            || FinderDimOverlayIdentity.pathBarConfirms(breadcrumbURLs, directory: directory, cutURLs: urls)
+        // A column view may keep the cut file visible in an ancestor column.
+        // Exact file URLs remain valid there; filename fallback still requires
+        // the current directory to match the source.
+        let directoryConfirmed = document.map { FinderDimOverlayIdentity.path($0) == FinderDimOverlayIdentity.path(directory) }
+            ?? FinderDimOverlayIdentity.pathBarConfirms(breadcrumbURLs, directory: directory, cutURLs: urls)
         guard let windowFrame = frame(window), let windows = windowList(),
               let windowID = findWindow(pid: pid, frame: windowFrame, in: windows) else {
             return .unavailable("无法唯一确认来源窗口，暂不显示淡化")
@@ -325,9 +353,9 @@ final class FinderDimOverlay {
         }
 
         let deadline = ProcessInfo.processInfo.systemUptime + 0.24
-        var nodes = [Node(element: window, depth: 0, inIconView: false, clip: windowFrame)]
+        var nodes = [Node(element: window, depth: 0, view: nil, clip: windowFrame, rowFrame: nil, parentFrame: nil)]
         var index = 0
-        var foundIconView = false
+        var foundFileView = false
         var matches: [String: [CGRect]] = [:]
         while index < nodes.count && index < 700 && ProcessInfo.processInfo.systemUptime < deadline {
             let node = nodes[index]
@@ -340,25 +368,36 @@ final class FinderDimOverlay {
             let role = values[safe: 0] as? String ?? ""
             let identifier = values[safe: 1] as? String ?? ""
             if ["AXToolbar", "AXMenuBar", "AXMenu"].contains(role) { continue }
-            let isIconView = identifier.lowercased() == "iconview"
-            foundIconView = foundIconView || isIconView
-            let inIconView = node.inIconView || isIconView
+            let rootView = FinderFileView(identifier: identifier)
+            let view = rootView ?? node.view
+            foundFileView = foundFileView || rootView != nil
+            // The sidebar also uses AXOutline; it is not a file view.
+            if role == "AXOutline", view == nil { continue }
             var clip = node.clip
             let nodeFrame = frame(position: values[safe: 6], size: values[safe: 7])
-            if role == "AXScrollArea" || isIconView, let nodeFrame {
+            if role == "AXScrollArea" || rootView != nil, let nodeFrame {
                 clip = clip.intersection(nodeFrame)
                 if !FinderDimOverlayGeometry.valid(clip) { continue }
             }
-            if inIconView, role == "AXImage", let nodeFrame {
+            let rowFrame = role == "AXRow" ? nodeFrame : (rootView == nil ? node.rowFrame : nil)
+            let isImage = (view == .icon || view == .gallery) && role == "AXImage"
+            let isFilename = (view == .list || view == .column) && role == "AXTextField"
+            if isImage || isFilename, let nodeFrame {
                 let names = [values[safe: 3], values[safe: 4], values[safe: 5]].compactMap { $0 as? String }
                 let rawURL = values[safe: 2]
                 let explicitURL = fileURL(rawURL)
                 // Do not reinterpret a non-file AXURL as a filename-only match.
                 let hasOtherURL = (rawURL is URL || rawURL is String) && explicitURL == nil
-                if !hasOtherURL, directoryConfirmed || explicitURL != nil,
+                // List rows may be expanded into other directories and column
+                // views show multiple directories. Require the file URL there.
+                let identityConfirmed = explicitURL != nil || (isImage && directoryConfirmed)
+                let itemFrame = isFilename
+                    ? FinderDimOverlayGeometry.fileRow(label: nodeFrame, container: rowFrame ?? node.parentFrame, viewport: clip)
+                    : nodeFrame
+                if !hasOtherURL, identityConfirmed,
                    let file = FinderDimOverlayIdentity.match(nodeURL: explicitURL, names: names,
                                                             directory: directory, cutURLs: urls),
-                   let rect = FinderDimOverlayGeometry.clip(nodeFrame, viewport: clip, window: windowFrame) {
+                   let rect = FinderDimOverlayGeometry.clip(itemFrame, viewport: clip, window: windowFrame) {
                     matches[FinderDimOverlayIdentity.path(file), default: []].append(rect)
                 }
                 continue
@@ -368,14 +407,15 @@ final class FinderDimOverlay {
             let children = elements(node.element, kAXVisibleChildrenAttribute)
                 ?? elements(node.element, kAXChildrenAttribute) ?? []
             for child in children.prefix(700 - min(nodes.count, 700)) {
-                nodes.append(Node(element: child, depth: node.depth + 1, inIconView: inIconView, clip: clip))
+                nodes.append(Node(element: child, depth: node.depth + 1, view: view, clip: clip,
+                                  rowFrame: rowFrame, parentFrame: nodeFrame))
             }
         }
         guard index >= nodes.count else {
             return .unavailable("Finder 项目较多或响应较慢，暂不显示淡化")
         }
-        guard foundIconView else {
-            return .unavailable("淡化当前支持 Finder 图标视图（⌘1）")
+        guard foundFileView else {
+            return .unavailable("未识别当前 Finder 文件视图，暂不显示淡化")
         }
         if !directoryConfirmed && matches.isEmpty {
             return .unavailable("无法确认文件位置；请在 Finder 的“显示”菜单开启“显示路径栏”后重试")
@@ -402,7 +442,7 @@ final class FinderDimOverlay {
         return .layout(layout)
     }
 
-    private static func pathBarURLs(_ window: AXUIElement) -> [URL] {
+    static func pathBarURLs(_ window: AXUIElement) -> [URL] {
         let deadline = ProcessInfo.processInfo.systemUptime + 0.15
         var queue: [(AXUIElement, Bool, Int)] = [(window, false, 0)]
         var index = 0
@@ -419,7 +459,7 @@ final class FinderDimOverlay {
             let identifier = (values[safe: 1] as? String ?? "").lowercased()
             let labels = [values[safe: 2], values[safe: 4], values[safe: 5]]
                 .compactMap { ($0 as? String)?.lowercased() }
-            if ["AXOutline", "AXToolbar", "AXMenuBar"].contains(role) || identifier == "iconview" { continue }
+            if ["AXOutline", "AXToolbar", "AXMenuBar"].contains(role) || FinderFileView(identifier: identifier) != nil { continue }
             let isPath = insidePath || (role == "AXList"
                 && (labels.contains(where: { ["路径", "path", "path bar"].contains($0) })
                     || identifier.contains("pathbar")))

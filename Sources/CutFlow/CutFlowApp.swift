@@ -4,11 +4,26 @@ import AppKit
 @main
 struct CutFlowApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    var body: some Scene { Settings { EmptyView() } }
+    var body: some Scene {
+        Settings { SettingsSceneView(delegate: delegate) }
+    }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var model: AppModel!
+private struct SettingsSceneView: View {
+    // The settings scene may be created before applicationDidFinishLaunching.
+    // Observe the delegate here so its later model assignment replaces loading.
+    @ObservedObject var delegate: AppDelegate
+
+    var body: some View {
+        Group {
+            if let model = delegate.model { SettingsView(model: model) }
+            else { ProgressView("正在启动 CutFlow…") }
+        }.frame(width: 640, height: 690)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+    @Published fileprivate var model: AppModel!
     private var statusItem: NSStatusItem!
     private var window: NSWindow?
 
@@ -115,7 +130,7 @@ struct SettingsView: View {
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
                     step("02", "⌘ X", "剪切，文件暂留原处", symbol: nil)
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                    step("03", "⌘ V", "到目标文件夹粘贴", symbol: nil)
+                    step("03", "⌘ V", "选中文件夹，直接粘贴", symbol: nil)
                 }
                 .padding(.vertical, 21)
                 .frame(maxWidth: .infinity)
@@ -123,8 +138,8 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 10) {
-                        Image(systemName: model.trusted && model.running ? "checkmark.circle.fill" : "lock.circle.fill")
-                            .font(.system(size: 23)).foregroundStyle(model.trusted && model.running ? Color.green : Color.orange)
+                        Image(systemName: model.shortcutFailure != nil ? "exclamationmark.triangle.fill" : (model.trusted && model.running ? "checkmark.circle.fill" : "lock.circle.fill"))
+                            .font(.system(size: 23)).foregroundStyle(model.trusted && model.running && model.shortcutFailure == nil ? Color.green : Color.orange)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(model.status).font(.system(size: 14, weight: .semibold))
                             Text(model.statusDetail).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -149,6 +164,8 @@ struct SettingsView: View {
                     DisclosureGroup("授权诊断与应用位置") {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(model.accessDiagnostic)
+                            Text(model.keyboardDiagnostic).textSelection(.enabled)
+                            Button("重启快捷键监听") { model.restartKeyboardListener() }
                             Text("当前应用：\(model.applicationPath)").textSelection(.enabled)
                         }.font(.system(size: 11)).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 6)
                     }.font(.system(size: 11))

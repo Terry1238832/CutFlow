@@ -10,11 +10,16 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$BUILD_CACHE/swift-cache"
 mkdir -p "$DESTINATION"
 DESTINATION="$(cd "$DESTINATION" && pwd)"
 cd "$PROJECT_DIR"
-swift build --disable-sandbox --cache-path "$BUILD_CACHE/swiftpm" --scratch-path "$BUILD_CACHE" -c release --arch arm64
-swift build --disable-sandbox --cache-path "$BUILD_CACHE/swiftpm" --scratch-path "$BUILD_CACHE" -c release --arch x86_64
+# SwiftPM's output layout differs between build engines. Keep architectures in
+# separate scratch directories and ask SwiftPM for each actual binary path.
+for ARCH in arm64 x86_64; do
+    swift build --disable-sandbox --cache-path "$BUILD_CACHE/swiftpm" --scratch-path "$BUILD_CACHE/$ARCH" -c release --arch "$ARCH"
+    BIN_DIR="$(swift build --disable-sandbox --cache-path "$BUILD_CACHE/swiftpm" --scratch-path "$BUILD_CACHE/$ARCH" -c release --arch "$ARCH" --show-bin-path)"
+    cp "$BIN_DIR/CutFlow" "$BUILD_CACHE/CutFlow-$ARCH"
+done
 APP="$DESTINATION/CutFlow.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-lipo -create "$BUILD_CACHE/arm64-apple-macosx/release/CutFlow" "$BUILD_CACHE/x86_64-apple-macosx/release/CutFlow" -output "$APP/Contents/MacOS/CutFlow"
+lipo -create "$BUILD_CACHE/CutFlow-arm64" "$BUILD_CACHE/CutFlow-x86_64" -output "$APP/Contents/MacOS/CutFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 swift -module-cache-path "$BUILD_CACHE/icon-cache" scripts/icon.swift "$BUILD_CACHE/AppIcon.iconset" "$APP/Contents/Resources/AppIcon.icns"
 SIGN_IDENTITY="${CUTFLOW_SIGN_IDENTITY:--}"

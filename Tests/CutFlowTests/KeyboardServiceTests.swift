@@ -19,7 +19,7 @@ final class KeyboardServiceTests: XCTestCase {
         board = NSPasteboard.withUniqueName()
         service = KeyboardService(pasteboard: board, currentApplication: { [unowned self] in
             owner.map { .init(bundleID: $0, pid: 1) }
-        }, fileContext: { [unowned self] _ in !editable }, uptime: { [unowned self] in now })
+        }, fileContext: { [unowned self] _ in !editable }, uptime: { [unowned self] in now }, finderCommand: nil)
     }
 
     override func tearDown() {
@@ -37,7 +37,7 @@ final class KeyboardServiceTests: XCTestCase {
     }
 
     @discardableResult private func send(_ event: CGEvent) -> CGEvent? {
-        service.handle(type: event.type, event: event)?.takeUnretainedValue()
+        service.handle(type: event.type, event: event)
     }
 
     private func writeFiles() {
@@ -55,27 +55,56 @@ final class KeyboardServiceTests: XCTestCase {
         let down = key(7)
         var text = Array("stale".utf16)
         down.keyboardSetUnicodeString(stringLength: text.count, unicodeString: &text)
-        XCTAssertNotNil(send(down))
-        XCTAssertEqual(down.getIntegerValueField(.keyboardEventKeycode), 8)
+        let translated = send(down)!
+        XCTAssertFalse(translated === down)
+        XCTAssertEqual(translated.getIntegerValueField(.keyboardEventKeycode), 8)
         var length = 0
         var actual = [UniChar](repeating: 0, count: 16)
-        down.keyboardGetUnicodeString(maxStringLength: actual.count, actualStringLength: &length, unicodeString: &actual)
-        XCTAssertEqual(String(utf16CodeUnits: actual, count: length), "c")
+        translated.keyboardGetUnicodeString(maxStringLength: actual.count, actualStringLength: &length, unicodeString: &actual)
+        XCTAssertNotEqual(String(utf16CodeUnits: actual, count: length), "stale")
+        XCTAssertEqual(NSEvent(cgEvent: translated)?.charactersIgnoringModifiers, "c")
         owner = "com.apple.TextEdit"
         let up = key(7, up: true, flags: [])
-        send(up)
-        XCTAssertEqual(up.getIntegerValueField(.keyboardEventKeycode), 8)
+        let translatedUp = send(up)!
+        XCTAssertEqual(translatedUp.getIntegerValueField(.keyboardEventKeycode), 8)
+    }
+
+    func testAppKitShortcutPayloadAlsoBecomesCopy() {
+        let original = NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: .command, timestamp: 1, windowNumber: 0, context: nil,
+            characters: "x", charactersIgnoringModifiers: "x", isARepeat: false, keyCode: 7)!
+        let translated = send(original.cgEvent!)!
+        let delivered = NSEvent(cgEvent: translated)!
+        XCTAssertEqual(delivered.keyCode, 8)
+        XCTAssertEqual(delivered.characters, "c")
+        XCTAssertEqual(delivered.charactersIgnoringModifiers, "c")
+        XCTAssertEqual(original.charactersIgnoringModifiers, "x")
+    }
+
+    func testAppKitPasteBecomesOptionPasteIncludingRelease() {
+        arm()
+        for (type, flags) in [(NSEvent.EventType.keyDown, NSEvent.ModifierFlags.command),
+                              (.keyUp, NSEvent.ModifierFlags())] {
+            let original = NSEvent.keyEvent(with: type, location: .zero,
+                modifierFlags: flags, timestamp: 1, windowNumber: 0, context: nil,
+                characters: "v", charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9)!
+            let delivered = NSEvent(cgEvent: send(original.cgEvent!)!)!
+            XCTAssertEqual(delivered.type, type)
+            XCTAssertEqual(delivered.keyCode, 9)
+            XCTAssertEqual(delivered.charactersIgnoringModifiers, "v")
+            XCTAssertTrue(delivered.modifierFlags.contains(.option))
+            XCTAssertEqual(delivered.modifierFlags.contains(.command), flags.contains(.command))
+        }
     }
 
     func testMultiFileCaptureAndMoveClearVisualState() {
         arm()
         XCTAssertEqual(service.cutFileURLs, files)
-        let down = key(9); send(down)
+        let down = send(key(9))!
         XCTAssertTrue(down.flags.contains(.maskAlternate))
         XCTAssertEqual(service.session.state, .idle)
         XCTAssertTrue(service.cutFileURLs.isEmpty)
-        let up = key(9, up: true, flags: [])
-        send(up)
+        let up = send(key(9, up: true, flags: []))!
         XCTAssertTrue(up.flags.contains(.maskAlternate))
         let second = key(9); send(second)
         XCTAssertFalse(second.flags.contains(.maskAlternate))
@@ -95,7 +124,7 @@ final class KeyboardServiceTests: XCTestCase {
         XCTAssertNil(send(key(9, repeatKey: true)))
         XCTAssertFalse(service.cutFileURLs.isEmpty)
         XCTAssertNil(send(key(9, up: true)))
-        let retry = key(9); send(retry)
+        let retry = send(key(9))!
         XCTAssertTrue(retry.flags.contains(.maskAlternate))
     }
 
@@ -141,7 +170,7 @@ final class KeyboardServiceTests: XCTestCase {
 
     func testCompatibilityModeBypassesOnlyTextProtection() {
         editable = true; service.protectText = false
-        let cut = key(7); send(cut)
+        let cut = send(key(7))!
         XCTAssertEqual(cut.getIntegerValueField(.keyboardEventKeycode), 8)
         owner = "com.apple.TextEdit"
         let outside = key(7); send(outside)
@@ -205,7 +234,7 @@ final class KeyboardServiceTests: XCTestCase {
         XCTAssertEqual(ignored.getIntegerValueField(.keyboardEventKeycode), 7)
         service.forkLift = true; arm()
         XCTAssertTrue(service.cutFileURLs.isEmpty)
-        let move = key(9); send(move)
+        let move = send(key(9))!
         XCTAssertTrue(move.flags.contains(.maskAlternate))
     }
 
@@ -214,7 +243,7 @@ final class KeyboardServiceTests: XCTestCase {
         let event = key(9); send(event)
         XCTAssertFalse(event.flags.contains(.maskAlternate))
         owner = "com.apple.finder"
-        let sourcePaste = key(9); send(sourcePaste)
+        let sourcePaste = send(key(9))!
         XCTAssertTrue(sourcePaste.flags.contains(.maskAlternate))
     }
 
@@ -223,6 +252,36 @@ final class KeyboardServiceTests: XCTestCase {
         _ = service.handle(type: .tapDisabledByTimeout, event: key(9))
         XCTAssertEqual(service.session.state, .idle)
         XCTAssertTrue(service.cutFileURLs.isEmpty)
+    }
+
+    func testCopyTimeoutLeavesADiagnosticInsteadOfOnlyReturningToIdle() {
+        send(key(7)); send(key(7, up: true))
+        now = 2
+        service.refreshClipboard()
+        XCTAssertEqual(service.session.state, .idle)
+        XCTAssertEqual(service.receivedKeyDownCount, 1)
+        XCTAssertTrue(service.shortcutHistory.last?.contains("复制超时") == true)
+    }
+
+    func testTextProtectionAndFocusChangeHaveDistinctDiagnostics() {
+        editable = true
+        send(key(7))
+        XCTAssertTrue(service.shortcutHistory.last?.contains("文字编辑保护") == true)
+        editable = false
+        send(key(7)); send(key(7, up: true))
+        owner = "com.apple.TextEdit"
+        service.refreshClipboard()
+        XCTAssertTrue(service.shortcutHistory.last?.contains("切换了应用") == true)
+    }
+
+    func testDiagnosticHistoryIsBoundedAndDoesNotRetainClipboardContent() {
+        for _ in 0..<10 {
+            send(key(7)); send(key(7, up: true))
+            board.clearContents(); board.setString("private clipboard content", forType: .string)
+            service.refreshClipboard()
+        }
+        XCTAssertEqual(service.shortcutHistory.count, 8)
+        XCTAssertFalse(service.shortcutHistory.joined().contains("private clipboard content"))
     }
 
     func testMouseAndScrollOnlySuspendVisualsAndKeepMoveIntent() {
