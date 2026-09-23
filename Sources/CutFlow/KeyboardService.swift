@@ -314,6 +314,12 @@ final class KeyboardService {
                     self.record("正在原地移动到选中文件夹")
                     self.finderContextMove(app.pid, {
                         valid() && self.finderDestination(app.pid, self.cutFileURLs) == .folder(folder)
+                    }, {
+                        // Finder's context menu takes focus and can obscure
+                        // AX selection. Preserve the snapshot checked above,
+                        // while still rejecting changes to the cut session,
+                        // clipboard or frontmost application.
+                        baseValid()
                     }, { [weak self] result in
                         self?.finishFinderCommand(.move, generation: generation, result: result)
                     })

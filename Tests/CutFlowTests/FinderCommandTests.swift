@@ -20,6 +20,7 @@ final class FinderCommandTests: XCTestCase {
     private var contextRequests = 0
     private var contextMoves = 0
     private var contextChecks: [() -> Void] = []
+    private var onMenuOpened: (() -> Void)?
     private let file = URL(fileURLWithPath: "/tmp/cutflow-test/剪切测试.txt")
 
     override func setUp() {
@@ -39,10 +40,12 @@ final class FinderCommandTests: XCTestCase {
             return outcome
         }, scheduleCommand: { [unowned self] in queued.append($0) },
         finderDestination: { [unowned self] _, _ in destination },
-        finderContextMove: { [unowned self] _, valid, finish in
+        finderContextMove: { [unowned self] _, preflight, transactionValid, finish in
             contextRequests += 1
             contextChecks.append { [unowned self] in
-                guard valid() else { finish(.failed("文件夹菜单已取消")); return }
+                guard preflight() else { finish(.failed("文件夹菜单已取消")); return }
+                onMenuOpened?()
+                guard transactionValid() else { finish(.failed("移动期间剪贴板或应用已变化")); return }
                 contextMoves += 1
                 finish(outcome)
             }
@@ -131,6 +134,24 @@ final class FinderCommandTests: XCTestCase {
     }
     func testTextFocusBeforeContextMenuReadyCancelsMove() {
         startSelectedFolderMove(); editable = true; finishContextMove()
+        XCTAssertEqual(contextMoves, 0)
+    }
+    func testContextMenuFocusCanHideSelectionWithoutCancellingMove() {
+        startSelectedFolderMove()
+        onMenuOpened = { [unowned self] in
+            editable = true
+            destination = .unavailable("菜单显示时所选行暂不可读")
+        }
+        finishContextMove()
+        XCTAssertEqual(contextMoves, 1)
+        XCTAssertEqual(service.session.state, .idle)
+    }
+    func testClipboardChangeWhileContextMenuOpenStillCancelsMove() {
+        startSelectedFolderMove()
+        onMenuOpened = { [unowned self] in
+            board.clearContents(); board.setString("replacement", forType: .string)
+        }
+        finishContextMove()
         XCTAssertEqual(contextMoves, 0)
     }
     func testFailureNeverFallsBackToOpeningAFolderOrParentDirectoryMove() {

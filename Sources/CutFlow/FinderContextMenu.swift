@@ -4,11 +4,16 @@ import ApplicationServices
 /// Finder's file-item context menu targets the selected folder. Its toolbar
 /// and Edit menus target the open directory, even with a folder selected.
 enum FinderContextMenu {
-    typealias Executor = (pid_t, @escaping () -> Bool, @escaping (FinderMenuCommand.Outcome) -> Void) -> Void
+    typealias Executor = (pid_t, @escaping () -> Bool, @escaping () -> Bool,
+                          @escaping (FinderMenuCommand.Outcome) -> Void) -> Void
     static let eventMarker: Int64 = 0x435546435458
 
     static func isMoveItem(identifier: String?, enabled: Bool) -> Bool {
         identifier == "cmdMoveItemsHere:" && enabled
+    }
+
+    static func canOpenMenu(physicalFlags: CGEventFlags) -> Bool {
+        !physicalFlags.contains(.maskCommand)
     }
 
     static func menuKey(down: Bool) -> CGEvent? {
@@ -20,34 +25,82 @@ enum FinderContextMenu {
         return event
     }
 
-    static func perform(pid: pid_t, stillValid: @escaping () -> Bool,
+    static func dismissKey(down: Bool) -> CGEvent? {
+        guard let event = NSEvent.keyEvent(with: down ? .keyDown : .keyUp,
+            location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false, keyCode: 53)?.cgEvent else { return nil }
+        event.setIntegerValueField(.eventSourceUserData, value: eventMarker)
+        return event
+    }
+
+    static func perform(pid: pid_t, preflight: @escaping () -> Bool,
+                        transactionValid: @escaping () -> Bool,
                         completion: @escaping (FinderMenuCommand.Outcome) -> Void) {
+        let releaseDeadline = ProcessInfo.processInfo.systemUptime + 1.5
+        func waitForCommandRelease() {
+            guard preflight() else {
+                completion(.failed("松开 ⌘ 前目标选择或剪贴板已变化，未执行移动。")); return
+            }
+            // The intercepted ⌘V key-down runs before the user's Command
+            // key-up. Opening the context menu with Command physically held
+            // can make Finder omit its Paste/Move items.
+            guard canOpenMenu(physicalFlags: CGEventSource.flagsState(.hidSystemState)) else {
+                guard ProcessInfo.processInfo.systemUptime <= releaseDeadline else {
+                    completion(.failed("等待 ⌘ 松开超时，未执行移动。")); return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: waitForCommandRelease)
+                return
+            }
+            performAfterRelease(pid: pid, preflight: preflight,
+                                transactionValid: transactionValid, completion: completion)
+        }
+        waitForCommandRelease()
+    }
+
+    private static func performAfterRelease(pid: pid_t, preflight: @escaping () -> Bool,
+                                            transactionValid: @escaping () -> Bool,
+                                            completion: @escaping (FinderMenuCommand.Outcome) -> Void) {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.06)
-        guard stillValid(), let window = element(value(app, kAXFocusedWindowAttribute)),
+        guard preflight(), let window = element(value(app, kAXFocusedWindowAttribute)),
               let view = fileView(window), let focus = element(value(app, kAXFocusedUIElementAttribute)) else {
             completion(.failed("无法确认 Finder 的文件视图，未执行移动。")); return
         }
         guard contextMenu(view) == nil else {
             completion(.failed("请先关闭 Finder 中已打开的快捷菜单，再按 ⌘V。")); return
         }
-        let valid = {
-            guard stillValid(), let current = element(value(app, kAXFocusedWindowAttribute)) else { return false }
-            return CFEqual(window, current)
+        // Once Finder opens a native menu, AXFocusedWindow may briefly be nil
+        // or refer to the menu itself. The verified file-view element remains
+        // tied to the original window. Input and clipboard changes invalidate
+        // the transaction in KeyboardService, so do not re-read menu focus.
+        let valid = transactionValid
+        guard preflight() else {
+            completion(.failed("执行前目标选择已变化，未执行移动。")); return
         }
-        let deadline = ProcessInfo.processInfo.systemUptime + 1.2
+        let deadline = ProcessInfo.processInfo.systemUptime + 2.0
         var shownMenu: AXUIElement?
         func finish(_ result: FinderMenuCommand.Outcome) {
             if case .failed = result, let shownMenu {
                 // Cancel only the menu we located, never send a global Escape.
-                _ = AXUIElementPerformAction(shownMenu, kAXCancelAction as CFString)
+                let cancelled = AXUIElementPerformAction(shownMenu, kAXCancelAction as CFString)
+                if cancelled != .success, valid(),
+                   let down = dismissKey(down: true), let up = dismissKey(down: false) {
+                    // Finder does not always expose AXCancel on its file menu.
+                    // These tagged events go only to the original Finder PID.
+                    down.postToPid(pid)
+                    up.postToPid(pid)
+                }
             }
             completion(result)
         }
         func poll() {
-            guard valid() else { finish(.failed("目标选择、窗口或剪贴板已变化，已取消移动。")); return }
+            guard valid() else { finish(.failed("剪贴板、应用或剪切状态已变化，已取消移动。")); return }
             guard ProcessInfo.processInfo.systemUptime <= deadline else {
-                finish(.failed("未能打开文件夹快捷菜单。请打开目标文件夹后再粘贴。")); return
+                finish(.failed(shownMenu == nil
+                    ? "未能打开文件夹快捷菜单。请打开目标文件夹后再粘贴。"
+                    : "Finder 菜单没有可用的移动命令。请先对文件按 ⌘X，再选中文件夹按 ⌘V。"))
+                return
             }
             if let menu = contextMenu(view) {
                 shownMenu = menu
@@ -62,7 +115,9 @@ enum FinderContextMenu {
                     finish(result == .success ? .performed : .failed("Finder 拒绝文件夹移动命令（\(result.rawValue)）。"))
                     return
                 }
-                finish(.failed("Finder 的文件夹快捷菜单没有可用的移动命令。"))
+                // Finder can publish the menu before its commands become
+                // available. Allow the bounded poll to observe the final menu.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: poll)
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: poll)

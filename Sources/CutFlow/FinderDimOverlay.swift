@@ -28,11 +28,15 @@ enum FinderDimOverlayIdentity {
     }
 
     static func match(nodeURL: URL?, names: [String], directory: URL, cutURLs: [URL]) -> URL? {
-        guard let parent = sourceDirectory(for: cutURLs), path(parent) == path(directory) else { return nil }
         if let nodeURL {
             guard nodeURL.isFileURL else { return nil }
+            // An expanded Finder list can display files from subfolders while
+            // the window itself remains at an ancestor directory. A verified
+            // AXURL is sufficient; only filename guesses need the source
+            // directory to match the open directory.
             return cutURLs.first { path($0) == path(nodeURL) }
         }
+        guard let parent = sourceDirectory(for: cutURLs), path(parent) == path(directory) else { return nil }
         let matches = cutURLs.filter { names.contains($0.lastPathComponent) }
         let paths = Set(matches.map(path))
         return paths.count == 1 ? matches.first : nil
@@ -54,6 +58,32 @@ enum FinderDimOverlayIdentity {
 }
 
 enum FinderDimOverlayGeometry {
+    struct WindowCandidate {
+        let id: CGWindowID
+        let pid: pid_t
+        let layer: Int
+        let frame: CGRect
+        let title: String?
+    }
+
+    static func sourceWindow(pid: pid_t, frame: CGRect, title: String?,
+                             candidates: [WindowCandidate]) -> CGWindowID? {
+        let matches = candidates.filter { candidate in
+            guard candidate.pid == pid, candidate.layer == 0,
+                  valid(candidate.frame), valid(frame) else { return false }
+            let overlap = candidate.frame.intersection(frame)
+            return valid(overlap)
+                && overlap.width * overlap.height / max(candidate.frame.width * candidate.frame.height,
+                                                        frame.width * frame.height) > 0.90
+        }
+        // Window Server returns front-to-back order. Finder can have two
+        // same-sized windows; refusing all duplicates made dimming disappear.
+        if let title, !title.isEmpty, matches.contains(where: { $0.title != nil }) {
+            return matches.first(where: { $0.title == title })?.id
+        }
+        return matches.first?.id
+    }
+
     /// Row containers may include expanded descendants. Only use a container
     /// that is a single line; otherwise shade the verified filename and icon.
     static func fileRow(label: CGRect, container: CGRect?, viewport: CGRect) -> CGRect {
@@ -84,6 +114,14 @@ enum FinderDimOverlayGeometry {
         guard valid(rect), valid(viewport), valid(window) else { return nil }
         let result = rect.intersection(viewport).intersection(window)
         return valid(result) && result.width >= 2 && result.height >= 2 ? result : nil
+    }
+}
+
+enum FinderDimAppearance {
+    static func wash(isDark: Bool) -> NSColor {
+        // Match Finder's light or dark canvas instead of laying a bright
+        // system-control color over a dark file list.
+        NSColor(calibratedWhite: isDark ? 0.16 : 0.97, alpha: isDark ? 0.60 : 0.66)
     }
 }
 
@@ -251,7 +289,8 @@ final class FinderDimOverlay {
         // Repeat the inexpensive Window Server check immediately before drawing.
         // This also rejects a window that moved while the AX query was in flight.
         guard let windows = Self.windowList(),
-              Self.findWindow(pid: pid, frame: layout.windowFrame, in: windows) == layout.windowID,
+              Self.findWindow(pid: pid, frame: layout.windowFrame,
+                              title: layout.windowTitle, in: windows) == layout.windowID,
               !Self.isObscured(layout, in: windows) else {
             panel?.orderOut(nil)
             lastLayout = nil
@@ -310,6 +349,7 @@ final class FinderDimOverlay {
     private struct Layout: Equatable {
         let windowID: CGWindowID
         let windowFrame: CGRect
+        let windowTitle: String?
         let items: [Item]
     }
 
@@ -324,7 +364,9 @@ final class FinderDimOverlay {
         let view: FinderFileView?
         let clip: CGRect
         let rowFrame: CGRect?
+        let rowElement: AXUIElement?
         let parentFrame: CGRect?
+        let prioritized: Bool
     }
 
     private static func query(pid: pid_t, directory: URL, urls: [URL],
@@ -344,20 +386,29 @@ final class FinderDimOverlay {
         // the current directory to match the source.
         let directoryConfirmed = document.map { FinderDimOverlayIdentity.path($0) == FinderDimOverlayIdentity.path(directory) }
             ?? FinderDimOverlayIdentity.pathBarConfirms(breadcrumbURLs, directory: directory, cutURLs: urls)
+        let windowTitle = attribute(window, kAXTitleAttribute) as? String
         guard let windowFrame = frame(window), let windows = windowList(),
-              let windowID = findWindow(pid: pid, frame: windowFrame, in: windows) else {
+              let windowID = findWindow(pid: pid, frame: windowFrame,
+                                        title: windowTitle, in: windows) else {
             return .unavailable("无法唯一确认来源窗口，暂不显示淡化")
         }
         guard expectedWindow == nil || expectedWindow == windowID else {
             return .unavailable("返回来源 Finder 窗口后显示淡化")
         }
 
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.24
-        var nodes = [Node(element: window, depth: 0, view: nil, clip: windowFrame, rowFrame: nil, parentFrame: nil)]
+        // Expanded list hierarchies expose many more AX cells than icon view.
+        // This query runs off the event-tap thread; give Finder enough time to
+        // return the visible rows while retaining a strict upper bound.
+        let deadline = ProcessInfo.processInfo.systemUptime + 1.6
+        let maxNodes = 1200
+        let wantedPaths = Set(urls.map(FinderDimOverlayIdentity.path))
+        var nodes = [Node(element: window, depth: 0, view: nil, clip: windowFrame,
+                          rowFrame: nil, rowElement: nil, parentFrame: nil, prioritized: false)]
         var index = 0
         var foundFileView = false
+        var exactMatchesComplete = false
         var matches: [String: [CGRect]] = [:]
-        while index < nodes.count && index < 700 && ProcessInfo.processInfo.systemUptime < deadline {
+        while index < nodes.count && index < maxNodes && ProcessInfo.processInfo.systemUptime < deadline {
             let node = nodes[index]
             index += 1
             guard node.depth < 14 else { continue }
@@ -380,12 +431,17 @@ final class FinderDimOverlay {
                 if !FinderDimOverlayGeometry.valid(clip) { continue }
             }
             let rowFrame = role == "AXRow" ? nodeFrame : (rootView == nil ? node.rowFrame : nil)
+            let rowElement = role == "AXRow" ? node.element : (rootView == nil ? node.rowElement : nil)
             let isImage = (view == .icon || view == .gallery) && role == "AXImage"
             let isFilename = (view == .list || view == .column) && role == "AXTextField"
             if isImage || isFilename, let nodeFrame {
                 let names = [values[safe: 3], values[safe: 4], values[safe: 5]].compactMap { $0 as? String }
                 let rawURL = values[safe: 2]
-                let explicitURL = fileURL(rawURL)
+                // Finder commonly puts AXURL on the list row or its icon,
+                // while the filename text field supplies only AXValue.
+                let explicitURL = fileURL(rawURL) ?? ((isFilename && names.contains(where: { name in
+                    urls.contains { $0.lastPathComponent == name }
+                })) ? rowElement.flatMap(verifiedRowURL) : nil)
                 // Do not reinterpret a non-file AXURL as a filename-only match.
                 let hasOtherURL = (rawURL is URL || rawURL is String) && explicitURL == nil
                 // List rows may be expanded into other directories and column
@@ -399,19 +455,39 @@ final class FinderDimOverlay {
                                                             directory: directory, cutURLs: urls),
                    let rect = FinderDimOverlayGeometry.clip(itemFrame, viewport: clip, window: windowFrame) {
                     matches[FinderDimOverlayIdentity.path(file), default: []].append(rect)
+                    if explicitURL != nil && Set(matches.keys) == wantedPaths {
+                        exactMatchesComplete = true
+                        break
+                    }
                 }
                 continue
+            }
+            if view != nil && (rootView != nil || role == "AXList"),
+               let selected = elements(node.element, kAXSelectedRowsAttribute)
+                    ?? elements(node.element, kAXSelectedChildrenAttribute), !selected.isEmpty {
+                // A selected cut item may be near the end of a huge expanded
+                // list. Inspect its verified AX row first, then fall back to
+                // the visible tree if it is not the cut source.
+                let prioritized = selected.prefix(max(0, maxNodes - nodes.count)).map {
+                    Node(element: $0, depth: node.depth + 1, view: view, clip: clip,
+                         rowFrame: nil, rowElement: nil, parentFrame: nodeFrame,
+                         prioritized: true)
+                }
+                nodes.insert(contentsOf: prioritized, at: index)
             }
             // Prefer the visible subset where Finder exposes it. For fallback
             // AXChildren, drawing is still clipped to every ancestor scroll area.
             let children = elements(node.element, kAXVisibleChildrenAttribute)
                 ?? elements(node.element, kAXChildrenAttribute) ?? []
-            for child in children.prefix(700 - min(nodes.count, 700)) {
-                nodes.append(Node(element: child, depth: node.depth + 1, view: view, clip: clip,
-                                  rowFrame: rowFrame, parentFrame: nodeFrame))
+            let next = children.prefix(maxNodes - min(nodes.count, maxNodes)).map {
+                Node(element: $0, depth: node.depth + 1, view: view, clip: clip,
+                     rowFrame: rowFrame, rowElement: rowElement, parentFrame: nodeFrame,
+                     prioritized: node.prioritized)
             }
+            if node.prioritized { nodes.insert(contentsOf: next, at: index) }
+            else { nodes.append(contentsOf: next) }
         }
-        guard index >= nodes.count else {
+        guard exactMatchesComplete || index >= nodes.count else {
             return .unavailable("Finder 项目较多或响应较慢，暂不显示淡化")
         }
         guard foundFileView else {
@@ -435,11 +511,28 @@ final class FinderDimOverlay {
               frame(finalWindow) == windowFrame else {
             return .unavailable("窗口正在变化，暂时隐藏淡化")
         }
-        let layout = Layout(windowID: windowID, windowFrame: windowFrame, items: items)
+        let layout = Layout(windowID: windowID, windowFrame: windowFrame,
+                            windowTitle: windowTitle, items: items)
         if let blocker = obscuringOwner(layout, in: windows) {
             return .unavailable("来源文件被“\(blocker)”窗口遮挡，暂时隐藏淡化")
         }
         return .layout(layout)
+    }
+
+    /// Inspect one candidate file row only. Expanded descendant rows are
+    /// excluded so their URLs cannot make a parent filename look like a cut file.
+    private static func verifiedRowURL(_ row: AXUIElement) -> URL? {
+        var queue = [row]
+        var index = 0
+        var urls = Set<URL>()
+        while index < queue.count && index < 48 {
+            let node = queue[index]; index += 1
+            if index > 1, (attribute(node, kAXRoleAttribute) as? String) == "AXRow" { continue }
+            if let url = fileURL(attribute(node, kAXURLAttribute)) { urls.insert(url) }
+            if urls.count > 1 { return nil }
+            queue += (elements(node, kAXChildrenAttribute) ?? []).prefix(48 - min(queue.count, 48))
+        }
+        return index >= queue.count ? urls.first : nil
     }
 
     static func pathBarURLs(_ window: AXUIElement) -> [URL] {
@@ -532,16 +625,18 @@ final class FinderDimOverlay {
         return CGRect(dictionaryRepresentation: bounds as CFDictionary)
     }
 
-    private static func findWindow(pid: pid_t, frame: CGRect, in windows: [[String: Any]]) -> CGWindowID? {
-        let matches = windows.compactMap { info -> CGWindowID? in
-            guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
-                  (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-                  let bounds = cgFrame(info), abs(bounds.minX - frame.minX) < 1,
-                  abs(bounds.minY - frame.minY) < 1, abs(bounds.width - frame.width) < 1,
-                  abs(bounds.height - frame.height) < 1 else { return nil }
-            return (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+    private static func findWindow(pid: pid_t, frame: CGRect, title: String?,
+                                   in windows: [[String: Any]]) -> CGWindowID? {
+        let candidates = windows.compactMap { info -> FinderDimOverlayGeometry.WindowCandidate? in
+            guard let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                  let bounds = cgFrame(info) else { return nil }
+            return .init(id: id, pid: owner, layer: layer, frame: bounds,
+                         title: info[kCGWindowName as String] as? String)
         }
-        return matches.count == 1 ? matches[0] : nil
+        return FinderDimOverlayGeometry.sourceWindow(pid: pid, frame: frame,
+                                                      title: title, candidates: candidates)
     }
 
     private static func isObscured(_ layout: Layout, in windows: [[String: Any]]) -> Bool {
@@ -599,10 +694,16 @@ private final class DimView: NSView {
     var rectangles: [CGRect] = [] { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill()
         dirtyRect.fill(using: .copy)
-        NSColor.controlBackgroundColor.withAlphaComponent(0.52).setFill()
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        FinderDimAppearance.wash(isDark: isDark).setFill()
         for rect in rectangles { NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill() }
     }
 }

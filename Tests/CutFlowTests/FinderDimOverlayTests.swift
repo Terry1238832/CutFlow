@@ -27,6 +27,13 @@ final class FinderDimOverlayTests: XCTestCase {
         XCTAssertEqual(FinderDimOverlayIdentity.match(nodeURL: alpha, names: [], directory: directory, cutURLs: [alpha]), alpha)
     }
 
+    func testExpandedListChildMatchesItsExplicitURLWhileWindowShowsAncestor() {
+        let root = URL(fileURLWithPath: "/tmp/CutFlow-check", isDirectory: true)
+        XCTAssertEqual(FinderDimOverlayIdentity.match(nodeURL: alpha, names: [], directory: root, cutURLs: [alpha]), alpha)
+        XCTAssertNil(FinderDimOverlayIdentity.match(nodeURL: beta, names: ["alpha.txt"], directory: root, cutURLs: [alpha]))
+        XCTAssertNil(FinderDimOverlayIdentity.match(nodeURL: nil, names: ["alpha.txt"], directory: root, cutURLs: [alpha]))
+    }
+
     func testNameFallbackRequiresExactFilename() {
         XCTAssertEqual(FinderDimOverlayIdentity.match(nodeURL: nil, names: ["alpha.txt"], directory: directory, cutURLs: [alpha]), alpha)
         XCTAssertNil(FinderDimOverlayIdentity.match(nodeURL: nil, names: ["alpha"], directory: directory, cutURLs: [alpha]))
@@ -128,11 +135,47 @@ final class FinderDimOverlayTests: XCTestCase {
         XCTAssertTrue(result.contains(label))
     }
 
+    func testSameSizedFinderWindowsUseMatchingTitleOrFrontmostCandidate() {
+        let frame = CGRect(x: 100, y: 120, width: 800, height: 600)
+        let candidates = [
+            FinderDimOverlayGeometry.WindowCandidate(id: 11, pid: 42, layer: 0, frame: frame, title: "other"),
+            FinderDimOverlayGeometry.WindowCandidate(id: 12, pid: 42, layer: 0, frame: frame, title: "source"),
+            FinderDimOverlayGeometry.WindowCandidate(id: 13, pid: 43, layer: 0, frame: frame, title: "source")
+        ]
+        XCTAssertEqual(FinderDimOverlayGeometry.sourceWindow(pid: 42, frame: frame,
+                                                               title: "source", candidates: candidates), 12)
+        XCTAssertEqual(FinderDimOverlayGeometry.sourceWindow(pid: 42, frame: frame,
+                                                               title: nil, candidates: candidates), 11)
+        XCTAssertNil(FinderDimOverlayGeometry.sourceWindow(pid: 42, frame: frame,
+                                                            title: "missing", candidates: candidates))
+    }
+
+    func testWindowMatchAllowsSmallFrameDifferencesButNotDifferentWindows() {
+        let frame = CGRect(x: 100, y: 120, width: 800, height: 600)
+        let candidates = [
+            FinderDimOverlayGeometry.WindowCandidate(id: 10, pid: 42, layer: 0,
+                frame: CGRect(x: 450, y: 300, width: 800, height: 600), title: nil),
+            FinderDimOverlayGeometry.WindowCandidate(id: 11, pid: 42, layer: 0,
+                frame: CGRect(x: 101, y: 120, width: 798, height: 578), title: nil)
+        ]
+        XCTAssertEqual(FinderDimOverlayGeometry.sourceWindow(pid: 42, frame: frame,
+                                                               title: nil, candidates: candidates), 11)
+    }
+
     func testSidebarAndPathBarAreNotClassifiedAsFileViews() {
         XCTAssertNil(FinderFileView(identifier: "Sidebar"))
         XCTAssertNil(FinderFileView(identifier: "PathBar"))
         XCTAssertNil(FinderFileView(identifier: "ListViewHeader"))
         XCTAssertEqual(FinderFileView(identifier: "ListView"), .list)
         XCTAssertEqual(FinderFileView(identifier: "ColumnView"), .column)
+    }
+
+    func testLightAndDarkWashMatchTheirFinderCanvases() {
+        let light = FinderDimAppearance.wash(isDark: false).usingColorSpace(.deviceRGB)!
+        let dark = FinderDimAppearance.wash(isDark: true).usingColorSpace(.deviceRGB)!
+        XCTAssertGreaterThan(light.redComponent, 0.9)
+        XCTAssertLessThan(dark.redComponent, 0.25)
+        XCTAssertGreaterThan(light.alphaComponent, 0.5)
+        XCTAssertGreaterThan(dark.alphaComponent, 0.5)
     }
 }
